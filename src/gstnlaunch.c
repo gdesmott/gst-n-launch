@@ -31,6 +31,9 @@ typedef struct _GstScalableTranscoder
   GstElement *pipeline;
   GMainLoop *loop;
   GList *branches;
+  GstState state;
+  gboolean buffering;
+  gboolean is_live;
 } GstScalableTranscoder;
 
 static gboolean
@@ -78,6 +81,49 @@ message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
       GST_DEBUG_OBJECT (thiz, "Got EOS\n");
       g_main_loop_quit (thiz->loop);
       break;
+
+    case GST_MESSAGE_STATE_CHANGED:
+    {
+      GstState old, new, pending;
+      if (GST_MESSAGE_SRC (message) == GST_OBJECT_CAST (thiz->pipeline)) {
+        gst_message_parse_state_changed (message, &old, &new, &pending);
+        if (thiz->state == GST_STATE_PAUSED && thiz->state == new) {
+          g_print ("Prerolled done\n");
+          g_print ("PLAYING\n");
+          gst_element_set_state (thiz->pipeline, GST_STATE_PLAYING);
+        }
+      }
+      break;
+    }
+    case GST_MESSAGE_BUFFERING:{
+      gint percent;
+
+      gst_message_parse_buffering (message, &percent);
+      g_print ("buffering  %d%% ", percent);
+
+      /* no state management needed for live pipelines */
+      if (thiz->is_live)
+        break;
+
+      if (percent == 100) {
+        /* a 100% message means buffering is done */
+        thiz->buffering = FALSE;
+        /* if the desired state is playing, go back */
+        if (thiz->state == GST_STATE_PLAYING) {
+          g_print ("Done buffering, setting pipeline to PLAYING ...\n");
+          gst_element_set_state (thiz->pipeline, GST_STATE_PLAYING);
+        }
+      } else {
+        /* buffering busy */
+        if (!thiz->buffering && thiz->state == GST_STATE_PLAYING) {
+          /* we were not buffering but PLAYING, PAUSE  the pipeline. */
+          g_print ("Buffering, setting pipeline to PAUSED ...\n");
+          gst_element_set_state (thiz->pipeline, GST_STATE_PAUSED);
+        }
+        thiz->buffering = TRUE;
+      }
+      break;
+    }
     default:
       break;
   }
@@ -181,6 +227,7 @@ int
 main (int argc, char **argv)
 {
   int res = EXIT_SUCCESS;
+  GstStateChangeReturn ret;
   GError *err = NULL;
   GOptionContext *ctx;
   GstScalableTranscoder *thiz = NULL;
@@ -216,6 +263,7 @@ main (int argc, char **argv)
   }
   thiz = g_new0 (GstScalableTranscoder, 1);
   thiz->pipeline = gst_pipeline_new ("gst-n-launch");
+  thiz->state = GST_STATE_NULL;
   for (branch = full_branch_desc_array; branch != NULL && *branch != NULL;
       ++branch) {
     if (!add_branch (thiz, NULL, *branch, NULL)) {
@@ -230,15 +278,32 @@ main (int argc, char **argv)
   g_signal_connect (G_OBJECT (bus), "message", G_CALLBACK (message_cb), thiz);
   gst_object_unref (GST_OBJECT (bus));
 
-  if (gst_element_set_state (thiz->pipeline,
-          GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE) {
-    GST_ERROR_OBJECT (thiz, "Failed to go into PLAYING state");
-    res = -3;
-    goto done;
+  ret = gst_element_set_state (thiz->pipeline, GST_STATE_PAUSED);
+
+  switch (ret) {
+    case GST_STATE_CHANGE_FAILURE:
+      g_printerr ("ERROR: Pipeline doesn't want to pause.\n");
+      res = -1;
+      goto done;
+    case GST_STATE_CHANGE_NO_PREROLL:
+      g_print ("Pipeline is live and does not need PREROLL ...\n");
+      thiz->is_live = TRUE;
+      break;
+    case GST_STATE_CHANGE_ASYNC:
+      g_print ("Pipeline is PREROLLING ...\n");
+      thiz->state = GST_STATE_PAUSED;
+      break;
+      /* fallthrough */
+    case GST_STATE_CHANGE_SUCCESS:
+      g_print ("Pipeline is PREROLLED ...\n");
+      gst_element_set_state (thiz->pipeline, GST_STATE_PLAYING);
+      break;
   }
-  g_print ("PLAYING");
+
   g_main_loop_run (thiz->loop);
   g_print ("STOP");
+  gst_element_set_state (thiz->pipeline, GST_STATE_READY);
+  /* No need to see all those pad caps going to NULL etc., it's just noise */
   gst_element_set_state (thiz->pipeline, GST_STATE_NULL);
 
 done:
