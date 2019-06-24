@@ -1,4 +1,4 @@
-project('gstnlaunch', 'c')
+project('gstnlaunch', 'c', version : '1.17.0.1', license : 'LGPL')
 
 cc = meson.get_compiler('c')
 
