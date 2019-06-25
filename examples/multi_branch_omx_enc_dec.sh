@@ -15,6 +15,6 @@ do
   CMD+=" -b \"$BRANCH_ENC_DEC_X\""
   #CMD+=" -b \"$BRANCH_ENC_DEC_X \""
 done
-echo "coucou"$INSTANCES
+
 echo $CMD
 eval $CMD
