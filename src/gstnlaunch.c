@@ -59,6 +59,7 @@ typedef struct _GstScalableBranch
   gboolean quiet;
   gchar **exclude_args;
   gulong deep_notify_id;
+  gboolean eos;
 } GstScalableBranch;
 
 #define PRINT(FMT, ARGS...) do { \
@@ -91,10 +92,24 @@ intr_handler (gpointer user_data)
 #endif
 
 static gboolean
+player_is_eos (GstNLaunchPlayer * player)
+{
+  GList *l;
+  GstScalableBranch *branch;
+  for (l = player->branches; l; l = l->next) {
+    branch = (GstScalableBranch *) l->data;
+    if (!branch->eos)
+      return FALSE;
+  }
+  return TRUE;
+}
+
+static gboolean
 message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
 {
   GstScalableBranch *thiz = (GstScalableBranch *) user_data;
-  GST_DEBUG_OBJECT (thiz, "Received new message");
+  GST_DEBUG_OBJECT (thiz, "Received new message %s from %s",
+      GST_MESSAGE_TYPE_NAME (message), GST_OBJECT_NAME (message->src));
   switch (GST_MESSAGE_TYPE (message)) {
     case GST_MESSAGE_ERROR:{
       GError *err = NULL;
@@ -133,8 +148,12 @@ message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
       break;
     }
     case GST_MESSAGE_EOS:
-      GST_DEBUG_OBJECT (thiz, "Got EOS\n");
-      g_main_loop_quit (thiz->player->loop);
+      GST_DEBUG_OBJECT (thiz, "Got EOS on branch");
+      thiz->eos = TRUE;
+      if (player_is_eos (thiz->player)) {
+        PRINT ("All pipelines are in EOS. Exit.");
+        g_main_loop_quit (thiz->player->loop);
+      }
       break;
 
     case GST_MESSAGE_STATE_CHANGED:
