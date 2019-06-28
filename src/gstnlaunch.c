@@ -29,8 +29,29 @@
 GST_DEBUG_CATEGORY (scalable_transcoder_debug);
 #define GST_CAT_DEFAULT scalable_transcoder_debug
 
+gboolean sQuiet = FALSE;
+
+#define SKIP(c) \
+  while (*c) { \
+    if ((*c == ' ') || (*c == '\n') || (*c == '\t') || (*c == '\r')) \
+      c++; \
+    else \
+      break; \
+  }
+
+typedef struct _GstNLaunchPlayer
+{
+  GMainLoop *loop;
+  guint signal_watch_intr_id;
+  GIOChannel *io_stdin;
+  GList *branches;
+  gboolean interactive;
+  GstState state;
+} GstNLaunchPlayer;
+
 typedef struct _GstScalableBranch
 {
+  GstNLaunchPlayer *player;
   GstElement *pipeline;
   GstState state;
   gboolean buffering;
@@ -40,15 +61,17 @@ typedef struct _GstScalableBranch
   gulong deep_notify_id;
 } GstScalableBranch;
 
-static GMainLoop *sLoop;
-static guint signal_watch_intr_id;
-static gboolean sQuiet = FALSE;
-
 #define PRINT(FMT, ARGS...) do { \
     if (!sQuiet) \
         g_print(FMT "\n", ## ARGS); \
     } while (0)
 
+void
+quit_app (GstNLaunchPlayer * thiz)
+{
+  if (thiz->loop)
+    g_main_loop_quit (thiz->loop);
+}
 
 #if defined(G_OS_UNIX) || defined(G_OS_WIN32)
 /* As the interrupt handler is dispatched from GMainContext as a GSourceFunc
@@ -56,12 +79,13 @@ static gboolean sQuiet = FALSE;
 static gboolean
 intr_handler (gpointer user_data)
 {
+  GstNLaunchPlayer *thiz = (GstNLaunchPlayer *) user_data;
+
   PRINT ("handling interrupt.");
-
-  g_main_loop_quit (sLoop);
-
+  quit_app (thiz);
   /* remove signal handler */
-  signal_watch_intr_id = 0;
+  thiz->signal_watch_intr_id = 0;
+
   return G_SOURCE_REMOVE;
 }
 #endif
@@ -88,7 +112,7 @@ message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
       g_free (debug);
       g_free (name);
 
-      g_main_loop_quit (sLoop);
+      g_main_loop_quit (thiz->player->loop);
       break;
     }
     case GST_MESSAGE_WARNING:{
@@ -110,7 +134,7 @@ message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
     }
     case GST_MESSAGE_EOS:
       GST_DEBUG_OBJECT (thiz, "Got EOS\n");
-      g_main_loop_quit (sLoop);
+      g_main_loop_quit (thiz->player->loop);
       break;
 
     case GST_MESSAGE_STATE_CHANGED:
@@ -120,8 +144,10 @@ message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
         gst_message_parse_state_changed (message, &old, &new, &pending);
         if (thiz->state == GST_STATE_PAUSED && thiz->state == new) {
           PRINT ("Prerolled done");
-          gst_element_set_state (thiz->pipeline, GST_STATE_PLAYING);
-          PRINT ("PLAYING");
+          if (!thiz->player->interactive) {
+            gst_element_set_state (thiz->pipeline, GST_STATE_PLAYING);
+            PRINT ("PLAYING!");
+          }
         }
       }
       break;
@@ -343,14 +369,67 @@ set_branch_state (GstScalableBranch * branch, GstState state)
       break;
       /* fallthrough */
     case GST_STATE_CHANGE_SUCCESS:
-      PRINT ("Pipeline is PREROLLED ...");
-      gst_element_set_state (branch->pipeline, GST_STATE_PLAYING);
+      if (branch->state == GST_STATE_PAUSED) {
+        PRINT ("Pipeline is PREROLLED ...");
+        gst_element_set_state (branch->pipeline, GST_STATE_PLAYING);
+      }
       break;
   }
   return res;
 }
 
+gboolean
+set_branches_state (GstNLaunchPlayer * thiz, GstState new_state)
+{
+  GList *l;
+  GstScalableBranch *branch;
+  for (l = thiz->branches; l; l = l->next) {
+    branch = (GstScalableBranch *) l->data;
+    if (!set_branch_state (branch, new_state))
+      return FALSE;
+  }
+  thiz->state = new_state;
+  return TRUE;
+}
 
+
+/* Process keyboard input */
+static gboolean
+handle_keyboard (GIOChannel * source, GIOCondition cond,
+    GstNLaunchPlayer * thiz)
+{
+  gchar *str = NULL;
+  char op;
+
+  if (g_io_channel_read_line (source, &str, NULL, NULL,
+          NULL) == G_IO_STATUS_NORMAL) {
+
+    gchar *cmd = str;
+    SKIP (cmd)
+        op = *cmd;
+    cmd++;
+    switch (op) {
+      case 'q':
+        quit_app (thiz);
+        break;
+      case 'p':
+        if (thiz->state == GST_STATE_PAUSED)
+          set_branches_state (thiz, GST_STATE_PLAYING);
+        else
+          set_branches_state (thiz, GST_STATE_PAUSED);
+        break;
+    }
+  }
+  g_free (str);
+  return TRUE;
+}
+
+void
+usage ()
+{
+  PRINT ("Available commands:\n"
+      "  p - Toggle between Play and Pause\n" "  q - Quit");
+}
 
 int
 main (int argc, char **argv)
@@ -358,22 +437,27 @@ main (int argc, char **argv)
   int res = EXIT_SUCCESS;
   GError *err = NULL;
   GOptionContext *ctx;
-  GList *branches = NULL;
-  GList *l = NULL;
+  GstNLaunchPlayer *thiz;
   GstScalableBranch *branch;
   gchar **full_branch_desc_array = NULL;
   gchar **branch_desc;
   gboolean verbose = FALSE;
+  gboolean interactive = FALSE;
 
   GOptionEntry options[] = {
     {"branch", 'b', 0, G_OPTION_ARG_STRING_ARRAY, &full_branch_desc_array,
-        "Add a custom full branch with gst-launch style description", NULL}
+        "Add a custom branch with gst-launch style description", NULL}
     ,
     {"verbose", 'v', 0, G_OPTION_ARG_NONE, &verbose,
-        ("Output status information and property notifications"), NULL},
+        ("Output status information and property notifications"), NULL}
+    ,
+    {"interactive", 'i', 0, G_OPTION_ARG_NONE, &interactive,
+        ("Put on interactive mode with branches in GST_STATE_READY"), NULL}
+    ,
     {NULL}
   };
 
+  thiz = g_new0 (GstNLaunchPlayer, 1);
 
   ctx = g_option_context_new ("[ADDITIONAL ARGUMENTS]");
   g_option_context_add_main_entries (ctx, options, NULL);
@@ -385,6 +469,7 @@ main (int argc, char **argv)
     goto done;
   }
   g_option_context_free (ctx);
+  thiz->interactive = interactive;
 
   GST_DEBUG_CATEGORY_INIT (scalable_transcoder_debug, "n-launch", 0,
       "gst-n-launch");
@@ -404,6 +489,7 @@ main (int argc, char **argv)
       PRINT ("ERROR: unable to add branch \"%s\"", *branch_desc);
       goto done;
     }
+    branch->player = thiz;
     bus = gst_pipeline_get_bus (GST_PIPELINE (branch->pipeline));
     g_signal_connect (G_OBJECT (bus), "message", G_CALLBACK (message_cb),
         branch);
@@ -415,31 +501,36 @@ main (int argc, char **argv)
           TRUE);
     }
     if (set_branch_state (branch, GST_STATE_READY))
-      branches = g_list_append (branches, branch);
+      thiz->branches = g_list_append (thiz->branches, branch);
     else
       goto done;
   }
   PRINT ("Branches created");
-  for (l = branches; l; l = l->next) {
-    branch = (GstScalableBranch *) l->data;
-    if (!set_branch_state (branch, GST_STATE_PAUSED))
-      goto done;
+  if (interactive) {
+    thiz->io_stdin = g_io_channel_unix_new (fileno (stdin));
+    g_io_add_watch (thiz->io_stdin, G_IO_IN, (GIOFunc) handle_keyboard, thiz);
+    usage ();
+  } else {
+    PRINT ("Branches set to PAUSE state");
+    set_branches_state (thiz, GST_STATE_PAUSED);
   }
-  PRINT ("Branches set to PAUSE state");
-  sLoop = g_main_loop_new (NULL, FALSE);
+
+  thiz->loop = g_main_loop_new (NULL, FALSE);
 #ifdef G_OS_UNIX
-  signal_watch_intr_id =
-      g_unix_signal_add (SIGINT, (GSourceFunc) intr_handler, sLoop);
+  thiz->signal_watch_intr_id =
+      g_unix_signal_add (SIGINT, (GSourceFunc) intr_handler, thiz);
 #endif
-  g_main_loop_run (sLoop);
+  g_main_loop_run (thiz->loop);
 
   /* No need to see all those pad caps going to NULL etc., it's just noise */
 
 done:
-  if (sLoop)
-    g_main_loop_unref (sLoop);
-  g_list_free_full (branches, destroy_branch);
-  branches = NULL;
+  if (thiz->loop)
+    g_main_loop_unref (thiz->loop);
+  g_list_free_full (thiz->branches, destroy_branch);
+  thiz->branches = NULL;
   g_strfreev (full_branch_desc_array);
+  g_free (thiz);
+
   return res;
 }
