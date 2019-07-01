@@ -237,6 +237,7 @@ message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
     }
     case GST_MESSAGE_EOS:
       thiz->eos = TRUE;
+      PRINT ("%s is EOS", GST_ELEMENT_NAME (thiz->pipeline));
       if (player_is_eos (thiz->player)) {
         PRINT ("All pipelines are in EOS. Exit.");
         g_main_loop_quit (thiz->player->loop);
